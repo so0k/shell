@@ -1,0 +1,238 @@
+name: Fork Node release
+
+# Fork-only prerelease of @strands-agents/shell (Node bindings, 2 targets) that
+# carries the grep binary-file fix. Never runs upstream; see FORK.md.
+# Branch push = dry run (build + pack); pushing a vX.Y.Z-grepfix.N tag releases.
+
+on:
+  push:
+    branches: [release/0.3.4-grepfix]
+    tags: ['v*-grepfix.*']
+
+concurrency:
+  group: fork-node-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Resolve version
+    if: github.repository == 'so0k/shell'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - id: v
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Branch pushes pack a placeholder version; only tags are released.
+          V=0.0.0-grepfix.0
+          [ "$REF_TYPE" = tag ] && V="${REF_NAME#v}"
+          if ! [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+-grepfix\.[0-9]+$ ]]; then
+            echo "::error::version '$V' must match MAJOR.MINOR.PATCH-grepfix.N."
+            exit 1
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+  node-builds:
+    name: Node addon (${{ matrix.target }})
+    needs: version
+    if: github.repository == 'so0k/shell'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Stamp version
+        uses: ./.github/actions/stamp-version
+        with:
+          version: ${{ needs.version.outputs.version }}
+
+      - name: Install cross-compile deps (linux aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: npm install
+        run: npm install
+
+      - name: napi build
+        # Same invocation as release.yml node-builds; the cross linker var is
+        # needed on aarch64-linux and ignored (empty) on native targets.
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && 'aarch64-linux-gnu-gcc' || '' }}
+        run: npx napi build --platform --release --features node --js native.js --dts native.d.ts --target ${{ matrix.target }} -- --lib
+
+      - name: Upload native artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: node-addon-${{ matrix.target }}
+          path: |
+            *.node
+            native.js
+            native.d.ts
+
+  node-pack:
+    name: Pack npm packages
+    needs: [version, node-builds]
+    if: github.repository == 'so0k/shell'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+
+      - name: Stamp version
+        uses: ./.github/actions/stamp-version
+        with:
+          version: ${{ needs.version.outputs.version }}
+
+      - name: npm install
+        run: npm install
+
+      - name: Download all native artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          pattern: node-addon-*
+          merge-multiple: true
+
+      - name: Restore generated loader into the main package
+        run: cp artifacts/native.js artifacts/native.d.ts ./
+
+      - name: Assemble npm packages (napi-rs v3, no publish)
+        run: |
+          npx napi create-npm-dirs
+          npx napi artifacts --output-dir ./artifacts --npm-dir ./npm
+          npx napi pre-publish -t npm --no-gh-release --skip-optional-publish
+
+      - name: Pack all packages
+        run: |
+          set -euo pipefail
+          mkdir -p dist-npm
+          npm pack --pack-destination dist-npm
+          for d in npm/*/; do (cd "$d" && npm pack --pack-destination "$GITHUB_WORKSPACE/dist-npm"); done
+
+      - name: Verify the packed set and versions
+        env:
+          EXPECTED: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          want=(
+            "strands-agents-shell-${EXPECTED}.tgz"
+            "strands-agents-shell-linux-arm64-gnu-${EXPECTED}.tgz"
+            "strands-agents-shell-darwin-arm64-${EXPECTED}.tgz"
+          )
+          # shellcheck disable=SC2012  # controlled .tgz names
+          actual=$(ls dist-npm/*.tgz | wc -l | tr -d ' ')
+          echo "Packed tarballs ($actual):"; ls -1 dist-npm/*.tgz
+          if [ "$actual" -ne 3 ]; then
+            echo "::error::Expected 3 tarballs but packed $actual."
+            exit 1
+          fi
+          for f in "${want[@]}"; do
+            if [ ! -f "dist-npm/$f" ]; then
+              echo "::error::missing dist-npm/$f"
+              exit 1
+            fi
+            v=$(tar -xOzf "dist-npm/$f" package/package.json | jq -r .version)
+            if [ "$v" != "$EXPECTED" ]; then
+              echo "::error::$f: version is '$v', expected '$EXPECTED'."
+              exit 1
+            fi
+          done
+          echo "optionalDependencies of the main package:"
+          tar -xOzf "dist-npm/strands-agents-shell-${EXPECTED}.tgz" package/package.json \
+            | jq -e --arg v "$EXPECTED" '.optionalDependencies == {"@strands-agents/shell-darwin-arm64": $v, "@strands-agents/shell-linux-arm64-gnu": $v}'
+
+      - name: Upload npm packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: npm-packages
+          path: dist-npm/*.tgz
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Attest and prerelease
+    needs: [version, node-pack]
+    if: github.repository == 'so0k/shell' && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      V: ${{ needs.version.outputs.version }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Download npm packages
+        uses: actions/download-artifact@v8
+        with:
+          name: npm-packages
+          path: dist-npm
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: dist-npm/*.tgz
+
+      - name: Write release notes
+        run: |
+          set -euo pipefail
+          base="https://github.com/$REPO/releases/download/v$V"
+          cat > notes.md <<EOF
+          Temporary fork build of \`@strands-agents/shell\` carrying the grep binary-file fix from strands-agents/shell#124 (fixes strands-agents/shell#123). Not an official release; switch back to upstream once it ships the fix. Verify with \`gh attestation verify <tgz> --repo $REPO\`.
+
+          Consumer \`package.json\`:
+
+          \`\`\`json
+          {
+            "dependencies": {
+              "@strands-agents/shell": "$base/strands-agents-shell-$V.tgz"
+            },
+            "overrides": {
+              "@strands-agents/shell-linux-arm64-gnu": "$base/strands-agents-shell-linux-arm64-gnu-$V.tgz",
+              "@strands-agents/shell-darwin-arm64": "$base/strands-agents-shell-darwin-arm64-$V.tgz"
+            }
+          }
+          \`\`\`
+          EOF
+
+      - name: Create prerelease
+        # The tag was pushed by a maintainer; GITHUB_TOKEN never pushes refs.
+        run: |
+          gh release create "v$V" dist-npm/*.tgz \
+            --repo "$REPO" \
+            --verify-tag \
+            --title "v$V" \
+            --notes-file notes.md \
+            --prerelease
